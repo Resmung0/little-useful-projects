@@ -3,6 +3,7 @@
 # dependencies = [
 #     "imagehash>=4.3.1",
 #     "numpy>=1.21.0",
+#     "opencv-contrib-python",
 #     "pillow>=9.0.0",
 #     "termcolor>=2.2.0",
 #     "tqdm>=4.65.0",
@@ -11,170 +12,214 @@
 
 #!/usr/bin/env python3
 
-import argparse
 import os
-import random
+from typing import Any, Literal
 
-import imagehash
-from PIL import Image
-from termcolor import colored
+import cv2
+import numpy as np
 from tqdm import tqdm
 
 
-def find_similar_images(directory, threshold=5) -> list:
-    """
-    Find similar images in the given directory using perceptual hashing.
+class ImageSimilarityDetector:
+    def __init__(self, threshold=0.7) -> None:
+        """
+        Initialize the similarity detector
 
-    :param directory: Path to the directory containing images
-    :param threshold: Hamming distance threshold for considering images similar
-    :return: List of lists of similar image paths
-    """
-    # Supported image extensions
-    image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"}
+        :param threshold: Similarity threshold (0-1)
+        :param use_gpu: Whether to use GPU acceleration
+        """
+        self.threshold = threshold
+        self.orb = cv2.ORB_create()
 
-    # Collect image paths
-    image_paths = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if os.path.splitext(file.lower())[1] in image_extensions:
-                image_paths.append(os.path.join(root, file))
+    def _preprocess_image(self, img_path: str) -> np.ndarray:
+        """
+        Load and preprocess image for comparison
 
-    # Compute image hashes with progress bar
-    print(colored("\n🔍 Scanning images...", "cyan"))
-    hashes = {}
-    for path in tqdm(image_paths, desc="Hashing", unit="image"):
-        try:
-            with Image.open(path) as img:
-                # Compute perceptual hash
-                phash = imagehash.phash(img)
-                hashes[path] = phash
-        except Exception as e:
-            print(colored(f"Error processing {path}: {e}", "yellow"))
+        :param img_path: Path to image file
+        :return: Preprocessed image
+        """
+        # Read image
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
 
-    # Find similar images with progress bar
-    print(colored("\n🔬 Detecting similar images...", "cyan"))
-    similar_images = []
-    checked = set()
+        # Resize to a standard size
+        img = cv2.resize(img, (300, 300))
 
-    paths_to_check = list(hashes.keys())
-    for path1 in tqdm(paths_to_check, desc="Comparing", unit="image"):
-        if path1 in checked:
-            continue
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        group = [path1]
-        checked.add(path1)
+        return gray
 
-        for path2, hash2 in hashes.items():
-            if path2 in checked:
+    def find_similar_images(self, directory: str) -> list[list[str]]:
+        """
+        Find similar images in a directory
+
+        :param directory: Path to directory containing images
+        :return: list of lists of similar image paths
+        """
+        # Supported image extensions
+        image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"}
+
+        # Collect image paths
+        image_paths = [
+            os.path.join(root, file)
+            for root, _, files in os.walk(directory)
+            for file in files
+            if os.path.splitext(file.lower())[1] in image_extensions
+        ]
+
+        # Prepare descriptors
+        print("Computing image descriptors...")
+        descriptors = {}
+        keypoints = {}
+
+        for path in tqdm(image_paths):
+            img = self._preprocess_image(path)
+            if img is not None:
+                kp, desc = self.orb.detectAndCompute(img, None)
+                if desc is not None:
+                    descriptors[path] = desc
+                    keypoints[path] = kp
+
+        # Find similar images
+        similar_groups = []
+        checked = set()
+
+        print("Comparing images...")
+        for path1 in tqdm(list(descriptors.keys())):
+            if path1 in checked:
                 continue
 
-            # Compare hash using Hamming distance
-            if hashes[path1] - hash2 <= threshold:
-                group.append(path2)
-                checked.add(path2)
+            group = [path1]
+            checked.add(path1)
 
-        if len(group) > 1:
-            similar_images.append(group)
+            for path2 in descriptors:
+                if path2 in checked or path2 == path1:
+                    continue
 
-    return similar_images
+                # Compare descriptors
+                similarity = self._compare_descriptors(
+                    descriptors[path1], descriptors[path2]
+                )
 
+                if similarity > self.threshold:
+                    group.append(path2)
+                    checked.add(path2)
 
-def delete_similar_images(similar_images, keep_mode="first") -> int:
-    """
-    Delete similar images based on the specified keep mode.
+            if len(group) > 1:
+                similar_groups.append(group)
 
-    :param similar_images: List of lists of similar image paths
-    :param keep_mode: Mode for keeping images ('first', 'last', or 'random')
-    :return: Number of images deleted
-    """
-    total_deleted = 0
+        return similar_groups
 
-    print(colored("\n🗑️  Deleting similar images...", "red"))
+    def _compare_descriptors(self, desc1, desc2) -> Any | Literal[0]:
+        """
+        Compare image descriptors
 
-    # Progress bar for deletion
-    for image_group in tqdm(similar_images, desc="Deleting Groups", unit="group"):
-        if len(image_group) <= 1:
-            continue
+        :param desc1: First image descriptor
+        :param desc2: Second image descriptor
+        :return: Similarity score
+        """
+        # Use FLANN matcher for efficient matching
+        # Create matcher
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-        # Determine which images to keep based on mode
-        if keep_mode == "first":
-            keep_index = 0
-        elif keep_mode == "last":
-            keep_index = -1
-        else:  # random
-            keep_index = random.randint(0, len(image_group) - 1)
+        # Match descriptors
+        matches = bf.match(desc1, desc2)
 
-        # Delete other images
-        for i, path in enumerate(image_group):
-            if i != keep_index:
-                try:
-                    os.remove(path)
-                    total_deleted += 1
-                    print(colored(f"Deleted: {path}", "red"))
-                except Exception as e:
-                    print(colored(f"Error deleting {path}: {e}", "yellow"))
+        # Sort matches by distance
+        matches = sorted(matches, key=lambda x: x.distance)
 
-    return total_deleted
+        # Calculate similarity based on good matches
+        # Lower distance means more similar
+        if len(matches) > 0:
+            # Compute average distance of top matches
+            similarity = 1 / (1 + np.mean([m.distance for m in matches[:10]]))
+            return similarity
+
+        return 0
+
+    def delete_similar_images(
+        self, similar_groups: list[list[str]], keep_mode="first"
+    ) -> int:
+        """
+        Delete similar images
+
+        :param similar_groups: Groups of similar images
+        :param keep_mode: Mode for keeping images ('first', 'last', 'random')
+        """
+        import random
+
+        deleted_count = 0
+        for group in similar_groups:
+            if len(group) <= 1:
+                continue
+
+            # Determine which image to keep
+            if keep_mode == "first":
+                keep_index = 0
+            elif keep_mode == "last":
+                keep_index = -1
+            else:
+                keep_index = random.randint(0, len(group) - 1)
+
+            # Delete other images
+            for i, path in enumerate(group):
+                if i != keep_index:
+                    try:
+                        os.remove(path)
+                        deleted_count += 1
+                        print(f"Deleted: {path}")
+                    except Exception as e:
+                        print(f"Error deleting {path}: {e}")
+
+        return deleted_count
 
 
 def main() -> None:
-    # Set up argument parsing
-    parser = argparse.ArgumentParser(
-        description=colored("🖼️  Find and Delete Similar Images", "green"),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Image Similarity Detector")
     parser.add_argument(
         "directory", type=str, help="Directory to search for similar images"
     )
     parser.add_argument(
-        "--threshold",
-        type=int,
-        default=5,
-        help="Hamming distance threshold for similarity (default: 5)",
+        "--threshold", type=float, default=0.7, help="Similarity threshold"
     )
     parser.add_argument(
         "--keep",
         choices=["first", "last", "random"],
         default="first",
-        help="Which image to keep when finding similar images (default: first)",
+        help="Which image to keep when finding similar images",
     )
-
-    # Parse arguments
     args = parser.parse_args()
 
-    # Validate directory
-    if not os.path.isdir(args.directory):
-        print(colored(f"Error: {args.directory} is not a valid directory.", "red"))
-        return
+    # Check for CUDA support
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        print("CUDA GPU detected and available!")
+    else:
+        print("No CUDA GPU detected. Falling back to CPU processing.")
+
+    # Initialize detector
+    detector = ImageSimilarityDetector(threshold=args.threshold)
 
     # Find similar images
-    print(colored(f"🔎 Searching for similar images in {args.directory}...", "cyan"))
-    similar_images = find_similar_images(args.directory, args.threshold)
+    similar_groups = detector.find_similar_images(args.directory)
 
-    # Print summary of similar image groups
-    print(colored("\n📊 Analysis Results:", "green"))
-    print(colored(f"Found {len(similar_images)} groups of similar images", "green"))
-    for i, group in enumerate(similar_images, 1):
-        print(colored(f"Group {i}: {len(group)} similar images", "yellow"))
-        for img in group[:3]:  # Show first 3 images in each group
+    # Print similar image groups
+    print("\nSimilar Image Groups:")
+    for i, group in enumerate(similar_groups, 1):
+        print(f"Group {i}: {len(group)} similar images")
+        for img in group[:3]:
             print(f"  - {img}")
         if len(group) > 3:
-            print(colored(f"    ... and {len(group)-3} more", "yellow"))
+            print(f"    ... and {len(group)-3} more")
 
     # Confirm deletion
-    confirm = input(
-        colored("\n❓ Do you want to delete similar images? (y/N): ", "cyan")
-    ).lower()
-    if confirm != "y":
-        print(colored("Deletion cancelled.", "yellow"))
-        return
-
-    # Delete similar images
-    deleted_count = delete_similar_images(similar_images, args.keep)
-
-    # Print final summary
-    print(colored("\n✅ Operation Complete!", "green"))
-    print(colored(f"Deleted {deleted_count} similar images.", "green"))
+    confirm = input("\nDelete similar images? (y/N): ").lower()
+    if confirm == "y":
+        deleted = detector.delete_similar_images(similar_groups, args.keep)
+        print(f"\nDeleted {deleted} similar images.")
 
 
 if __name__ == "__main__":
